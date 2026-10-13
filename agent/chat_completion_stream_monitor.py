@@ -79,6 +79,7 @@ class StreamingWaitMonitor:
             if _hb_now - self._mon.last_heartbeat >= _HEARTBEAT_INTERVAL:
                 self._mon.last_heartbeat = _hb_now
                 self._heartbeat(int(_hb_now - self.last_chunk_time["t"]))
+            self._steer_restart_check()
             _stale_elapsed = time.time() - self.last_chunk_time["t"]
             if _stale_elapsed > self._stream_stale_timeout:
                 self._mon.wait_notice_started_ts = None  # Reconnect status has its own owner.

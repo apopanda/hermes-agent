@@ -29,7 +29,7 @@ from acp_adapter.commands import SlashCommandsMixin, _estimate_tokens
 from acp_adapter.content import PromptBlock, _content_blocks_to_openai_user_content, _extract_text
 from acp_adapter.events import (
     AssistantMessageIdAllocator, _build_plan_update_from_todo_result, _send_update, flush_open_tool_calls,
-    make_message_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
+    make_message_cb, make_status_cb, make_step_cb, make_thinking_cb, make_tool_progress_cb,
 )
 from acp_adapter.model_catalog import build_model_state, encode_model_choice
 from acp_adapter.permissions import make_approval_callback
@@ -540,11 +540,23 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         return InitializeResponse(
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=get_version_info().base_version),
+            # JetBrains ACP clients probe the AGENT-INFO-level _meta
+            # (client.getAgentInfo().get_meta() -> parseSteeringSupport) to
+            # decide whether the nudge/steer UI is offered; the
+            # _session/steering extension below answers the probe.
+            field_meta={
+                "steering": {"supported": True},
+            },
             agent_capabilities=AgentCapabilities(
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
                     fork=SessionForkCapabilities(), list=SessionListCapabilities(), resume=SessionResumeCapabilities(),
+                    # Older JetBrains builds probe the session-capabilities
+                    # _meta instead; keep both markers.
+                    field_meta={
+                        "steering": {"supported": True},
+                    },
                 ),
             ),
             auth_methods=auth_methods,
@@ -662,6 +674,68 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             except Exception:
                 logger.debug("Failed to interrupt ACP session %s", session_id, exc_info=True)
         logger.info("Cancelled session %s", session_id)
+
+    async def ext_method(self, method: str, params: dict[str, Any]) -> Any:
+        """Handle ACP extension methods (wire names are ``_session/...``).
+
+        Implements the JetBrains ``session/steering`` contract: mid-turn
+        guidance from the editor's nudge UI. When a turn is live the text is
+        routed to the agent's ``redirect()``/``steer()`` machinery; with no
+        live turn the text is queued as the next prompt and reported as
+        ``startedNewTurn``.
+        """
+        if method != "session/steering":
+            raise acp.RequestError.method_not_found(f"_{method}")
+
+        session_id = str(params.get("sessionId") or "")
+        state = self.session_manager.get_session(session_id)
+        if state is None:
+            logger.warning("Steering request for unknown session %s", session_id)
+            return {"outcome": "startedNewTurn"}
+
+        blocks = params.get("prompt") or []
+        text = " ".join(
+            block.get("text", "") for block in blocks
+            if isinstance(block, dict) and block.get("type") == "text"
+        ).strip()
+        logger.info(
+            "ACP steering request: session=%s running=%s text=%r",
+            session_id, bool(state.is_running), text[:80],
+        )
+        if not text:
+            return {"outcome": "startedNewTurn"}
+
+        agent = state.agent
+        if state.is_running and hasattr(agent, "redirect"):
+            try:
+                if agent.redirect(text):
+                    return {"outcome": "injected"}
+            except Exception:
+                logger.debug("Active-turn steering redirect failed", exc_info=True)
+        if state.is_running and hasattr(agent, "steer"):
+            try:
+                if agent.steer(text):
+                    return {"outcome": "injected"}
+            except Exception:
+                logger.debug("Active-turn steering steer() failed", exc_info=True)
+
+        with state.runtime_lock:
+            state.queued_prompts.append(text)
+            depth = len(state.queued_prompts)
+        conn = self._conn
+        if conn:
+            loop = asyncio.get_running_loop()
+            update = acp.update_agent_message_text(
+                f"Agent idle — steering text queued as the next turn. ({depth} queued)"
+            )
+            from agent.async_utils import safe_schedule_threadsafe
+            safe_schedule_threadsafe(
+                conn.session_update(session_id, update),
+                loop,
+                logger=logger,
+                log_message="Failed to send steering queue notice",
+            )
+        return {"outcome": "startedNewTurn"}
 
     async def fork_session(
         self, cwd: str, session_id: str, mcp_servers: list | None = None, **kwargs: Any
@@ -824,6 +898,13 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
+        logger.info(
+            "ACP prompt received: session=%s running=%s queued=%d text=%r",
+            session_id,
+            bool(state.is_running),
+            len(state.queued_prompts),
+            user_text[:80],
+        )
         text_only_prompt = all(isinstance(block, TextContentBlock) for block in prompt)
         if not user_text and not (isinstance(user_content, list) and user_content):
             return PromptResponse(stop_reason="end_turn")
@@ -855,6 +936,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             state.cancel_event.clear()
         cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
 
+        # Chat-window nudges only inject into plugin MCP tool results; during
+        # native-tool stretches nothing drains them and a turn end purges
+        # them. Run a poller that sweeps pending nudges into the live agent.
+        nudge_poller = None
+        try:
+            from acp_adapter.nudge_poller import start_nudge_poller
+
+            nudge_poller = start_nudge_poller(session_id, state.agent)
+        except Exception:
+            logger.debug("Could not start nudge poller", exc_info=True)
+
         def _run_agent() -> dict:
             try:
                 return self._run_agent_turn(
@@ -880,6 +972,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
+        if nudge_poller is not None:
+            nudge_poller.stop()
+
         return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
 
     def _flush_turn_tool_calls(
@@ -887,6 +982,29 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     ) -> None:
         """Close any tool call the turn left open, so no bubble spins after the turn ends."""
         if not conn or cbs.tool_call_ids is None:
+            return
+
+    # ---- Slash commands (headless) -------------------------------------------
+
+    @classmethod
+    def _available_commands(cls) -> list[AvailableCommand]:
+        commands: list[AvailableCommand] = []
+        for spec in cls._ADVERTISED_COMMANDS:
+            input_hint = spec.get("input_hint")
+            commands.append(
+                AvailableCommand(
+                    name=spec["name"],
+                    description=spec["description"],
+                    input=UnstructuredCommandInput(hint=input_hint)
+                    if input_hint
+                    else None,
+                )
+            )
+        return commands
+
+    async def _send_available_commands_update(self, session_id: str) -> None:
+        """Advertise supported slash commands to the connected ACP client."""
+        if not self._conn:
             return
         try:
             flush_open_tool_calls(conn, session_id, loop, cbs.tool_call_ids, cbs.tool_call_meta or {})

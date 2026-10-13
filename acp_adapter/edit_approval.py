@@ -12,6 +12,8 @@ import json
 import logging
 import re
 import tempfile
+import threading
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from itertools import count
@@ -40,6 +42,28 @@ EditApprovalRequester = Callable[[EditProposal], bool]
 
 _EDIT_APPROVAL_REQUESTER: ContextVar[EditApprovalRequester | None] = ContextVar("ACP_EDIT_APPROVAL_REQUESTER", default=None)
 _PERMISSION_REQUEST_IDS = count(1)
+
+# Session-scoped edit approvals granted via the ACP "Allow edits for session"
+# option: acp session id -> set of granted scopes ("all"). In-memory only, so a
+# bridge restart clears them; sensitive paths always re-prompt regardless.
+_edit_session_lock = threading.Lock()
+_edit_session_approvals: dict[str, set[str]] = {}
+
+
+def grant_edit_session(session_id: str, scope: str = "all") -> None:
+    with _edit_session_lock:
+        _edit_session_approvals.setdefault(session_id, set()).add(scope)
+
+
+def has_edit_session_grant(session_id: str, scope: str = "all") -> bool:
+    with _edit_session_lock:
+        return scope in _edit_session_approvals.get(session_id, set())
+
+
+def clear_edit_session(session_id: str) -> None:
+    with _edit_session_lock:
+        _edit_session_approvals.pop(session_id, None)
+
 
 SENSITIVE_AUTO_APPROVE_NAMES = {".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"}
 AUTO_APPROVE_ASK = "ask"
@@ -228,13 +252,30 @@ def make_acp_edit_approval_requester(
             except Exception:
                 logger.debug("ACP edit auto-approval policy check failed", exc_info=True)
 
+        if has_edit_session_grant(session_id) and not _is_sensitive_auto_approve_path(proposal.path):
+            return True
+
         response, _timed_out = await_permission(
-            request_permission_fn, loop, session_id, tool_call=build_acp_edit_tool_call(proposal),
+            request_permission_fn, loop, session_id,
+            tool_call=build_acp_edit_tool_call(proposal),
             options=[PermissionOption(option_id="allow_once", kind="allow_once", name="Allow edit"),
+                     # ACP has no session-scoped kind; the option id carries the
+                     # Hermes semantics, mirroring permissions.py.
+                     PermissionOption(
+                         option_id="allow_session", kind="allow_always", name="Allow edits for session",
+                     ),
                      PermissionOption(option_id="deny", kind="reject_once", name="Deny")],
             timeout=resolve_permission_timeout(timeout), what="Edit approval request", send_update=send_update,
         )
         outcome = getattr(response, "outcome", None)
-        return getattr(outcome, "outcome", None) == "selected" and getattr(outcome, "option_id", None) == "allow_once"
+        if not getattr(outcome, "outcome", None) == "selected":
+            return False
+        option_id = getattr(outcome, "option_id", None)
+        if option_id == "allow_once":
+            return True
+        if option_id == "allow_session":
+            grant_edit_session(session_id)
+            return True
+        return False
 
     return _requester

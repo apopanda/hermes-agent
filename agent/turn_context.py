@@ -1134,6 +1134,24 @@ def build_turn_context(
     # System prompt is cached per session for prefix caching.
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
+    else:
+        try:
+            from agent.conversation_loop import (
+                context_files_stamp_status,
+                rebuild_for_context_stamp,
+            )
+
+            _stale, _reason = context_files_stamp_status(
+                agent, agent._cached_system_prompt
+            )
+            if _stale:
+                rebuild_for_context_stamp(
+                    agent,
+                    system_message,
+                    reason=_reason,
+                )
+        except Exception:
+            logger.debug("context-stamp refresh check failed", exc_info=True)
     active_system_prompt = agent._cached_system_prompt
 
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat" session (same

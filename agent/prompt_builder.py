@@ -1688,15 +1688,37 @@ def load_soul_md(context_length: Optional[int] = None, home_override: Path | Non
         return None
 
 
-def _read_context_file(path: Path) -> str:
-    """Stripped text of *path*; "" when missing, empty or unreadable (logged at debug)."""
-    if not path.exists():
-        return ""
+def _load_agent_rules_md(
+    context_length: Optional[int] = None,
+    home_override: "Path | None" = None,
+) -> Optional[str]:
+    """Load AGENT-RULES.md from HERMES_HOME and return its content, or None.
+
+    Injected alongside SOUL.md on every surface, independent of cwd.
+    """
+    _home = Path(home_override) if home_override is not None else get_hermes_home()
+    rules_path = _home / "AGENT-RULES.md"
+    if not rules_path.exists():
+        return None
     try:
-        return (_read_text_with_timeout(path) or "").strip()
+        content = rules_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "AGENT-RULES.md")
+        return _truncate_content(
+            content, "AGENT-RULES.md", context_length=context_length,
+            read_path=str(rules_path),
+        )
     except Exception as e:
-        logger.debug("Could not read %s: %s", path, e)
-        return ""
+        logger.debug("Could not read AGENT-RULES.md from %s: %s", rules_path, e)
+        return None
+
+
+def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str:
+    """DEPRECATED legacy single-file loader — superseded by the candidates-based
+    ``_load_hermes_md`` further down; kept only because the old ``_read_context_file``
+    body merged here. Not called by the current build."""
+    return ""
 
 
 def _context_section(content: str, label: str, warn_name: str, path: Path, context_length: Optional[int]) -> str:
@@ -1851,9 +1873,18 @@ def build_context_files_prompt(
 ) -> str:
     """Discover and load context files for the system prompt (each capped, see ``_get_context_file_max_chars``).
 
-    Only ONE project context type loads, first found wins: .hermes.md/HERMES.md (walk to git root) →
-    AGENTS.md chain (git root → cwd) → CLAUDE.md (cwd) → .cursorrules + .cursor/rules/*.mdc (cwd). SOUL.md
-    from HERMES_HOME is independent and always included unless *skip_soul* (already the identity slot).
+    SOUL.md from HERMES_HOME is independent and always included when present.
+
+    Each context source is capped before injection. The cap defaults to the
+    model's context window (scaled — see ``_dynamic_context_file_max_chars``)
+    when *context_length* is provided, falling back to 20,000 chars otherwise.
+    An explicit ``context_file_max_chars`` in config.yaml always wins.
+
+    When *skip_soul* is True, SOUL.md is not included here (it was already
+    loaded via ``load_soul_md()`` for the identity slot).
+
+    AGENT-RULES.md from HERMES_HOME is also injected when present —
+    independent of cwd, on every surface.
     """
     cwd_path = Path(cwd if cwd is not None else os.getcwd()).resolve()
     if _project_context_suppressed(cwd, cwd_path, allow_install_tree_fallback):
@@ -1866,8 +1897,15 @@ def build_context_files_prompt(
         sections = [_load_hermes_md(cwd_path, context_length) or _load_agents_md(cwd_path, context_length)
                     or _load_claude_md(cwd_path, context_length) or _load_cursorrules(cwd_path, context_length)]
     if not skip_soul:
-        sections.append(load_soul_md(context_length, home_override=home_override))
-    sections = [s for s in sections if s]
+        soul_content = load_soul_md(context_length, home_override=home_override)
+        if soul_content:
+            sections.append(soul_content)
+
+    rules_content = _load_agent_rules_md(
+        context_length, home_override=home_override)
+    if rules_content:
+        sections.append(rules_content)
+
     if not sections:
         return ""
     return ("# Project Context\n\nThe following project context files have been loaded and should be followed:\n\n"

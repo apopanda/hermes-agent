@@ -783,6 +783,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # The profile line names this home's path, so it rides in the volatile tier: the stable
     # prefix then stays byte-identical across every profile (and home) on the host.
     volatile_parts.append(_active_profile_line(agent))
+    # Durable context files (SOUL.md / AGENT-RULES.md) stamp: lets the restore
+    # path detect edits and rebuild the prompt once per change (context stamp).
+    try:
+        _cfp = context_files_fingerprint(_agent_home(agent))
+        if _cfp != "unavailable":
+            volatile_parts.append(f"Context files stamp: {_cfp}")
+    except Exception:
+        pass
     volatile_parts.append(_timestamp_line(agent))
     # Keep the renderer-owned runtime anchor after all user/plugin prose so quoted
     # host examples cannot shadow it during persisted-prompt validation.
@@ -853,6 +861,29 @@ def reconstruct_static_prefix(agent: Any, system_message: Optional[str] = None, 
         logger.debug("static system-prefix reconstruction failed on %s", log_label, exc_info=True)
     agent._cached_system_prompt_static = None
     agent._static_rebuild_failed_for = stored
+
+
+_CONTEXT_STAMP_PREFIX = "Context files stamp: "
+_CONTEXT_STAMP_RE_TEXT = r"Context files stamp: ([0-9a-f]{12})"
+
+
+def context_files_fingerprint(home: str | os.PathLike) -> str:
+    """Stable 12-hex fingerprint of the durable context files (SOUL.md +
+    AGENT-RULES.md). Missing files hash as 'missing'; any read failure
+    returns 'unavailable' so callers fail closed to no-rebuild."""
+    try:
+        import hashlib
+
+        parts = []
+        for name in ("SOUL.md", "AGENT-RULES.md"):
+            try:
+                with open(os.path.join(home, name), "rb") as fh:
+                    parts.append(name.encode("utf-8") + b"\0" + fh.read())
+            except Exception:
+                parts.append(name.encode("utf-8") + b"\0missing")
+        return hashlib.sha1(b"\1".join(parts)).hexdigest()[:12]
+    except Exception:
+        return "unavailable"
 
 
 def format_tools_for_system_message(agent: Any) -> str:

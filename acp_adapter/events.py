@@ -181,6 +181,47 @@ def make_tool_progress_cb(
 # Assistant message identity
 # ------------------------------------------------------------------
 
+def make_status_cb(
+    conn: acp.Client,
+    session_id: str,
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[Callable, Callable]:
+    """Create a ``(status_callback, finish)`` pair for AIAgent.
+
+    Lifecycle statuses (compression, provider retries, fallback switches)
+    stream into one persistent ACP tool card (kind=think) so the editor
+    shows activity instead of a silent hang. ``finish`` closes the card.
+    """
+    state: Dict[str, Any] = {"id": None}
+
+    def _emit_status(kind: str, message: str) -> None:
+        if not message:
+            return
+        if state["id"] is None:
+            state["id"] = make_tool_call_id()
+            start = acp.start_tool_call(
+                state["id"], message, kind="think", status="in_progress",
+                content=[acp.tool_content(acp.text_block(message))],
+            )
+            _send_update(conn, session_id, loop, start)
+        else:
+            update = acp.update_tool_call(
+                state["id"],
+                title=message[:200],
+                content=[acp.tool_content(acp.text_block(message))],
+                status="in_progress",
+            )
+            _send_update(conn, session_id, loop, update)
+
+    def finish() -> None:
+        tc_id = state.get("id")
+        if not tc_id:
+            return
+        state["id"] = None
+        update = acp.update_tool_call(tc_id, status="completed")
+        _send_update(conn, session_id, loop, update)
+
+    return _emit_status, finish
 
 class AssistantMessageIdAllocator:
     """Allocates stable per-message ids for streamed assistant chunks.

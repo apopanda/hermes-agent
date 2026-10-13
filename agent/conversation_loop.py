@@ -738,6 +738,71 @@ def _refresh_bot_chat_tools(agent) -> None:
                        agent.session_id, exc)
 
 
+def context_files_stamp_status(
+    agent, stored_prompt: str
+) -> tuple[bool, str]:
+    """Compare a stored prompt's context-files stamp against current disk.
+
+    Returns ``(stale, reason)``. Fail-closed: any error → not stale, so a
+    broken probe can never turn into a rebuild-every-turn cache burner.
+    """
+    try:
+        from agent.system_prompt import _agent_home as _spa_home
+        from agent.system_prompt import context_files_fingerprint as _cff
+
+        _stamp_home = _spa_home(agent)
+        _m = re.search(
+            r"Context files stamp: ([0-9a-f]{12})", stored_prompt or ""
+        )
+        _current = _cff(_stamp_home)
+        if _current == "unavailable":
+            return False, ""
+        if _m is None:
+            return True, "no stamp (legacy prompt)"
+        if _m.group(1) != _current:
+            return True, "SOUL.md/AGENT-RULES.md changed"
+        return False, ""
+    except Exception:
+        return False, ""
+
+
+def rebuild_for_context_stamp(
+    agent, system_message=None, reason: str = "", conversation_history=None
+) -> None:
+    """Rebuild + persist the system prompt to adopt changed context files.
+
+    One-time per change: the rebuilt prompt embeds the new stamp, so the
+    next turn restores verbatim again (prefix-cache warm).
+    """
+    logger.info(
+        "Context-files stamp stale for session %s (%s); rebuilding system "
+        "prompt to adopt the new SOUL/AGENT-RULES (one-time prefix-cache "
+        "break).",
+        getattr(agent, "session_id", "?"),
+        reason,
+    )
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    if getattr(agent, "_session_db", None):
+        try:
+            agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+        except Exception as exc:
+            logger.warning(
+                "Session DB update_system_prompt failed after context-files "
+                "refresh (session=%s): %s. The refresh will re-fire next "
+                "turn.",
+                getattr(agent, "session_id", "?"),
+                exc,
+            )
+
+
 def _restore_or_build_system_prompt(agent, system_message, conversation_history):
     """Restore the cached system prompt from the session DB or build it fresh.
 
@@ -790,6 +855,14 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "Session DB update_system_prompt failed after Bot Chat capability refresh "
                 "(session=%s): %s. The refresh will re-fire next turn.",
                 persist_tools=True,
+            )
+            return
+        _stamp_stale, _stamp_reason = context_files_stamp_status(
+            agent, stored_prompt
+        )
+        if _stamp_stale:
+            rebuild_for_context_stamp(
+                agent, system_message, reason=_stamp_reason
             )
             return
         # Continuing session — reuse the exact system prompt from the

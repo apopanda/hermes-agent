@@ -151,6 +151,12 @@ class SessionState:
     # Per-session allocator for ACP assistant messageIds (lazily created by
     # the server so streamed chunks group into distinct assistant replies).
     message_ids: Any = None
+    # monotonic timestamp of the last observed sign of life from the running
+    # turn (stream deltas, tool progress, step callbacks). A prompt arriving
+    # while ``is_running`` is True but this timestamp is stale treats the turn
+    # as dead: it resets the flag and drains queued prompts instead of
+    # queueing behind a wedged executor (#hermes-steer-wedge).
+    last_activity_at: float = 0.0
 
 
 class SessionManager:

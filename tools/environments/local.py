@@ -510,7 +510,6 @@ def restore_managed_env(env: dict) -> dict:
             env[key] = os.environ[key]
     return env
 
-
 # --- Shell discovery ---
 def _find_bash() -> str:
     """Resolve the shell Hermes runs commands with. Owned by pm (the store
