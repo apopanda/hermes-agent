@@ -3852,60 +3852,13 @@ class _StreamingCall(StreamingWaitMonitor):
         self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
     def _steer_restart_check(self) -> None:
-        """Pending steer + stream still pre-first-token: attach the steer to the
-        request's own message list and force-close the attempt so the inner retry
-        re-sends WITH the steer in context (~1s, cache-absorbed) instead of the
-        model finishing a plan the nudge was meant to redirect. Post-first-token
-        (or no tool message to attach to): re-queue for the next tool boundary.
-        Mirrors ``_kill_stale_stream``'s abort mechanics minus the stale breaker."""
-        steer_text = getattr(self.agent, "_pending_steer", None)
-        steer_lock = getattr(self.agent, "_pending_steer_lock", None)
-        if not steer_text or steer_lock is None:
+        """Pending steer: leave it queued for the next API-call boundary
+        (_drain_pending_steer injects it into the last tool message) or the
+        end-of-turn queue drain. Never abort the live stream: killing the
+        transport mid-think turned the steer into a dead turn whenever the
+        nudge arrived while the model was still reasoning."""
+        if not getattr(self.agent, "_pending_steer", None):
             return
-        with steer_lock:
-            steer_text = getattr(self.agent, "_pending_steer", None)
-            if steer_text:
-                self.agent._pending_steer = None
-        if not steer_text:
-            return
-        injected = False
-        messages = self.api_kwargs.get("messages")
-        if isinstance(messages, list) and messages:
-            for msg in reversed(messages):
-                if isinstance(msg, dict) and msg.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-
-                    marker = format_steer_marker(steer_text)
-                    existing = msg.get("content", "")
-                    if isinstance(existing, str):
-                        msg["content"] = existing + marker
-                        injected = True
-                    else:
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            msg["content"] = blocks
-                            injected = True
-                        except Exception:
-                            injected = False
-                    break
-        if injected and not self.deltas_were_sent["yes"]:
-            logger.info(
-                "In-stream steer restart: aborting active stream to attach "
-                "pending steer (%d chars) to the retried request",
-                len(steer_text),
-            )
-            killed_response = self._attempt_stream_response
-            with contextlib.suppress(Exception):
-                self._cancel_current_stream_attempt("steer_restart")
-                self.clients.close_once("steer_restart")
-            self._shutdown_stale_attempt_socket(killed_response)
-            self.last_chunk_time["t"] = time.time()
-        else:
-            with steer_lock:
-                existing = getattr(self.agent, "_pending_steer", None)
-                self.agent._pending_steer = (
-                    steer_text + "\n" + existing) if existing else steer_text
 
     def _abort_for_interrupt(self, stale_elapsed: float) -> None:
         """/stop seen by the monitor: mark cancelled, abort the request-local

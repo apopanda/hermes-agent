@@ -957,6 +957,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 # Still on the executor thread: ``_send_update`` blocks on the loop, so flushing
                 # here (not after ``run_in_executor``) lands the update before the response.
                 self._flush_turn_tool_calls(cbs, session_id, conn, loop)
+                if nudge_poller is not None:
+                    nudge_poller.stop()
 
         try:
             # ACP `session_id` is the stable handle; agent.session_id is the internal head that
@@ -971,9 +973,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.is_running = False
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
-
-        if nudge_poller is not None:
-            nudge_poller.stop()
 
         return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
 
